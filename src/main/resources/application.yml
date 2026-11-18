@@ -7,6 +7,9 @@ spring:
     url: jdbc:postgresql://localhost:5432/vulnwatch
     username: vulnwatch
     password: vulnwatch
+  elasticsearch:
+    # Local-dev default; Docker Compose overrides it with SPRING_ELASTICSEARCH_URIS.
+    uris: http://localhost:9200
   jpa:
     # Do not keep a DB session open while the JSON response is written; all loading happens in services.
     open-in-view: false
@@ -60,3 +63,9 @@ vulnwatch:
       initial-backoff: 6s
       multiplier: 2
       max-backoff: 60s
+
+  search:
+    # Name of the Elasticsearch index that holds the searchable copy of every CVE.
+    index-name: cves
+    # CVEs loaded from Postgres and sent to Elasticsearch per bulk request when rebuilding the index.
+    reindex-batch-size: 500

@@ -7,6 +7,8 @@ import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.Collection;
+import java.util.List;
 import java.util.Locale;
 
 /**
@@ -37,5 +39,12 @@ public class CveService {
         Page<Cve> result = repository.findAll(
                 CveSpecifications.matching(filter), PageRequest.of(page, size, NEWEST_FIRST));
         return PageResponse.from(result.map(CveResponse::from));
+    }
+
+    /** Loads the stored CVEs with these IDs; IDs that are not stored are skipped. */
+    public List<CveResponse> getByIds(Collection<String> ids) {
+        return repository.findAllById(ids).stream()
+                .map(CveResponse::from)
+                .toList();
     }
 }

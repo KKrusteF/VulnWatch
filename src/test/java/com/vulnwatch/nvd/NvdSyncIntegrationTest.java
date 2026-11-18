@@ -11,6 +11,8 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
+import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
+import com.vulnwatch.search.CveSearchIndexer;
 import org.springframework.web.client.HttpServerErrorException;
 
 import java.time.Clock;
@@ -28,6 +30,9 @@ import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.wireMoc
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.hamcrest.Matchers.contains;
+import static org.mockito.ArgumentMatchers.anyCollection;
+import static org.mockito.Mockito.doThrow;
+
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -66,6 +71,10 @@ class NvdSyncIntegrationTest extends AbstractIntegrationTest {
 
     @MockitoBean
     Clock clock;
+
+    // A real indexer that a test can make fail on purpose.
+    @MockitoSpyBean
+    CveSearchIndexer spiedIndexer;
 
     @Autowired
     NvdSyncService syncService;
@@ -243,6 +252,43 @@ class NvdSyncIntegrationTest extends AbstractIntegrationTest {
 
         assertThat(cveRepository.count()).isEqualTo(2);
         assertThat(syncStateRepository.findById(NvdSyncService.SOURCE)).isEmpty();
+    }
+
+    @Test
+    void syncedCvesAreSearchable() throws Exception {
+        stubPage(0, 2, cve("CVE-2026-0001", "2026-11-17T10:00:00.000", "HIGH", "apache"),
+                cve("CVE-2026-0002", "2026-11-17T11:00:00.000", "LOW"));
+
+        syncService.sync();
+        indexManager.refresh();
+
+        mockMvc.perform(get("/api/cves/search").param("q", "description"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.totalItems").value(2));
+        mockMvc.perform(get("/api/cves/search").param("q", "description").param("vendor", "apache"))
+                .andExpect(jsonPath("$.items[*].id", contains("CVE-2026-0001")));
+    }
+
+    @Test
+    void failedIndexingKeepsTheCursorAndTheNextSyncRepairsTheIndex() {
+        stubPage(0, 2, cve("CVE-2026-0001", "2026-11-17T10:00:00.000", "HIGH"),
+                cve("CVE-2026-0002", "2026-11-17T11:00:00.000", "LOW"));
+        doThrow(new IllegalStateException("Elasticsearch is down")).when(spiedIndexer).indexByIds(anyCollection());
+
+        assertThatThrownBy(() -> syncService.sync()).hasMessage("Elasticsearch is down");
+
+        assertThat(syncStateRepository.findById(NvdSyncService.SOURCE)).isEmpty();
+        assertThat(cveRepository.count()).isEqualTo(2);
+        indexManager.refresh();
+        assertThat(indexManager.documentCount()).isZero();
+
+        org.mockito.Mockito.reset(spiedIndexer); // back to the real indexer
+        SyncResult second = syncService.sync();
+        indexManager.refresh();
+
+        assertThat(second.unchanged()).isEqualTo(2);
+        assertThat(indexManager.documentCount()).isEqualTo(2);
+        assertThat(cursor()).isEqualTo(NOW);
     }
 
     private void setNow(Instant now) {

@@ -26,4 +26,17 @@ public interface CveRepository extends JpaRepository<Cve, String>, JpaSpecificat
             limit :limit
             """)
     List<VendorCount> findTopVendors(@Param("limit") int limit);
+
+    /**
+     * One batch of CVE IDs in ID order, starting after {@code afterId} (keyset pagination).
+     * Used to walk the whole table when rebuilding the search index, without OFFSET.
+     */
+    @Query(nativeQuery = true, value = """
+            select cve_id
+            from cve
+            where cve_id > :afterId
+            order by cve_id
+            limit :limit
+            """)
+    List<String> findIdsAfter(@Param("afterId") String afterId, @Param("limit") int limit);
 }

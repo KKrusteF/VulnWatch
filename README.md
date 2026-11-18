@@ -2,20 +2,20 @@
 
 A CVE feed aggregator built with Java 21 and Spring Boot 3. It polls the public
 [NVD CVE API](https://nvd.nist.gov/developers/vulnerabilities), keeps every CVE in PostgreSQL,
-and exposes a REST API on top. Kafka and Elasticsearch are added in later stages.
+indexes them into Elasticsearch for full-text search, and exposes a REST API on top. Kafka is added in the last stage.
 
-The project is built in four stages. **Stages 1 and 2 are done**; the rest are planned.
+The project is built in four stages. **Stages 1 to 3 are done**; stage 4 is planned.
 
 | Stage | What it adds | Status |
 |---|---|---|
 | 1 | REST API and PostgreSQL (Flyway schema, get by ID, filtered list, stats) | done |
 | 2 | Scheduled NVD ingestion with retry/backoff, upsert by CVE ID | done |
-| 3 | Elasticsearch index and full-text search | planned |
+| 3 | Elasticsearch index with an explicit mapping, full-text search with filters | done |
 | 4 | Kafka between ingestion and indexing | planned |
 
 ## Architecture
 
-Solid lines exist today. Dashed parts arrive in later stages.
+Solid lines exist today. Dashed parts arrive in stage 4, where Kafka replaces the direct indexing call.
 
 ```mermaid
 flowchart LR
@@ -23,20 +23,21 @@ flowchart LR
     nvd[/NVD CVE API/]
 
     subgraph app["VulnWatch (Spring Boot)"]
-        api["REST API<br/>/api/cves, /api/stats"]
+        api["REST API<br/>/api/cves, /api/cves/search, /api/stats"]
         ingest["NVD sync<br/>scheduled, paced, retried"]
         indexer["Kafka consumer / indexer<br/>(stage 4)"]:::planned
     end
 
     pg[("PostgreSQL<br/>source of truth")]
     kafka{{"Kafka topic<br/>(stage 4)"}}:::planned
-    es[("Elasticsearch<br/>(stage 3)")]:::planned
+    es[("Elasticsearch<br/>search index, rebuildable")]
 
     client --> api
     api -->|get by ID, list, stats| pg
-    api -.->|full-text search| es
+    api -->|full-text search| es
     nvd -->|CVEs modified since last sync| ingest
     ingest -->|upsert by CVE ID, save sync cursor| pg
+    ingest -->|index each stored page, document ID = CVE ID| es
     ingest -.->|event per new or changed CVE| kafka
     kafka -.-> indexer
     indexer -.->|index, document ID = CVE ID| es
@@ -54,8 +55,9 @@ NvdSyncService       works out the time window: from the saved cursor to now
      |-- NvdClient         one paced HTTP request, retried on 429 / 5xx / network errors
      |-- NvdCveMapper      NVD JSON -> the fields VulnWatch stores
      |-- CveUpsertService  insert new, update changed, skip unchanged (one transaction per page)
+     |-- CveSearchIndexer  reads the stored rows back from Postgres and bulk-indexes them
      |
-     saves the cursor (sync_state table) once the whole window is stored
+     saves the cursor (sync_state table) once the whole window is stored and indexed
 ```
 
 How an API request works:
@@ -77,7 +79,8 @@ internet connection. Nothing else.
 docker compose up --build
 ```
 
-This builds the app image and starts PostgreSQL and the app. Ten seconds after startup the
+This builds the app image and starts PostgreSQL, Elasticsearch and the app. Elasticsearch needs
+about 1 GB of memory and half a minute to start; the app waits for it. Ten seconds after startup the
 first sync begins and fetches every CVE that NVD modified in the last 7 days. That is usually a
 few thousand CVEs and takes under a minute, because requests are spaced 6 seconds apart. When
 you see this line in the log, the data is there:
@@ -88,22 +91,49 @@ NVD sync finished: window ... to ..., fetched 8801, created 8801, updated 0, unc
 
 Then try these in a browser:
 
+- <http://localhost:8080/api/cves/search?q=remote+code+execution&size=5>
+- <http://localhost:8080/api/cves/search?q=overflow&severity=critical>
+- <http://localhost:8080/api/cves/search?q=%22sql+injection%22>
 - <http://localhost:8080/api/stats?topVendors=5>
-- <http://localhost:8080/api/cves?severity=critical&size=5>
 - <http://localhost:8080/api/cves?vendor=microsoft>
 - `http://localhost:8080/api/cves/<an ID from the list>`
 
 After that the app syncs again every 2 hours, asking only for what changed since the last run.
 Restarting is safe: the cursor is stored in the database, so the next sync continues from there.
 
-Stop with `Ctrl+C`, then `docker compose down`. Add `-v` to also delete the database volume.
+Stop with `Ctrl+C`, then `docker compose down`. Add `-v` to also delete the database and
+search index volumes.
 
-If port 8080 or 5432 is already taken on your machine, pick others:
+If port 8080, 5432 or 9200 is already taken on your machine, pick others:
 
 ```sh
-APP_PORT=8081 POSTGRES_PORT=5433 docker compose up --build        # bash
-$env:APP_PORT=8081; $env:POSTGRES_PORT=5433; docker compose up --build   # PowerShell
+APP_PORT=8081 POSTGRES_PORT=5433 ES_PORT=9201 docker compose up --build        # bash
+$env:APP_PORT=8081; $env:POSTGRES_PORT=5433; $env:ES_PORT=9201; docker compose up --build   # PowerShell
 ```
+
+## Search index
+
+PostgreSQL is the source of truth. The Elasticsearch index `cves` is a copy built for searching
+and can be thrown away at any time.
+
+- The mapping is explicit and strict: `src/main/resources/elasticsearch/cve-index.json`.
+  `description` is analysed English text; `severity` and `vendors` are exact keywords;
+  unknown fields are rejected.
+- The document ID is the CVE ID, so indexing a CVE again overwrites it instead of duplicating it.
+- After each page of a sync is stored in PostgreSQL, the same CVEs are read back from PostgreSQL
+  and sent to Elasticsearch in one bulk request. If that fails, the sync run fails, the cursor
+  stays where it was, and the next run indexes the same window again.
+- On startup the app creates the index if it is missing. If the index holds fewer documents than
+  PostgreSQL has CVEs, it rebuilds the whole index from PostgreSQL.
+
+To rebuild the index by hand, delete it and restart the app:
+
+```sh
+curl -X DELETE http://localhost:9200/cves
+docker compose restart app
+```
+
+Elasticsearch runs without TLS and passwords here. That is for local development only.
 
 ## NVD sync settings
 
@@ -172,7 +202,20 @@ Lists CVEs, newest first. Every parameter is optional and filters combine with A
 { "items": [ { "id": "CVE-2021-44228", "...": "..." } ], "page": 0, "size": 20, "totalItems": 8801, "totalPages": 441 }
 ```
 
-Full-text search on the description arrives with Elasticsearch in stage 3.
+This endpoint reads from PostgreSQL.
+
+### `GET /api/cves/search`
+
+Full-text search on the description, answered by Elasticsearch. Results are ordered by relevance,
+then newest first. The response has the same shape as `GET /api/cves`.
+
+| Parameter | Meaning | Example |
+|---|---|---|
+| `q` | Required. Words that must all appear in the description. Word endings are ignored (`executing` finds `execution`). Use quotes for an exact phrase and `-` to exclude a word. | `q="sql injection" -wordpress` |
+| `severity`, `vendor`, `publishedFrom`, `publishedTo` | Same filters as `GET /api/cves`. | `severity=critical` |
+| `page`, `size` | Same as `GET /api/cves`. Only the first 10,000 results can be paged through; beyond that the request is rejected with `400`. | `page=2&size=50` |
+
+A CVE becomes searchable about a second after it is indexed.
 
 ### `GET /api/stats`
 
@@ -194,9 +237,9 @@ On Windows `cmd` or PowerShell, write `.\gradlew.bat` instead of `./gradlew`.
 
 | Command | What it does |
 |---|---|
-| `./gradlew test` | Runs the tests. They start a throwaway PostgreSQL container with Testcontainers and a fake NVD server, so they never call the real NVD. |
-| `./gradlew bootTestRun` | Runs the app on port 8080 against a throwaway PostgreSQL container, syncing from the real NVD. Data is gone when you stop it. |
-| `docker compose up -d postgres` then `./gradlew bootRun` | Runs the app from source against the Compose database, which keeps its data. |
+| `./gradlew test` | Runs the tests. They start throwaway PostgreSQL and Elasticsearch containers with Testcontainers and a fake NVD server, so they never call the real NVD. |
+| `./gradlew bootTestRun` | Runs the app on port 8080 against throwaway PostgreSQL and Elasticsearch containers, syncing from the real NVD. Data is gone when you stop it. |
+| `docker compose up -d postgres elasticsearch` then `./gradlew bootRun` | Runs the app from source against the Compose database and search index, which keep their data. |
 | `./gradlew build` | Compiles, tests and builds the runnable jar in `build/libs/`. |
 
 To look inside the database while Compose is running:
@@ -215,10 +258,12 @@ compose.yaml, Dockerfile           the local stack and the app image
 src/main/resources/
   application.yml                  configuration
   db/migration/V*.sql              Flyway database migrations
+  elasticsearch/cve-index.json     the Elasticsearch index mapping
 src/main/java/com/vulnwatch/
   VulnWatchApplication.java        entry point
   cve/                             the CVE entity, repository, read service, upsert service, controller
   nvd/                             NVD client, JSON mapping, sync service, scheduler, settings
+  search/                          index creation, indexing from Postgres, search service and endpoint
   stats/                           the stats endpoint
   web/                             shared HTTP pieces: error handling, paging, converters
 src/test/java/com/vulnwatch/       tests (JUnit 5, Testcontainers, MockMvc, WireMock)
