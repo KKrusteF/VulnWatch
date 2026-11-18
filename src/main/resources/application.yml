@@ -20,6 +20,11 @@ spring:
         # Store and read timestamps in UTC regardless of the machine's time zone.
         jdbc:
           time_zone: UTC
+          # Send up to 100 INSERT/UPDATE statements to Postgres in one round trip.
+          batch_size: 100
+        # Group statements by table so batching works across many CVEs and their vendors.
+        order_inserts: true
+        order_updates: true
 
 management:
   endpoints:
@@ -27,3 +32,31 @@ management:
       exposure:
         # Only expose the harmless actuator endpoints over HTTP.
         include: health,info
+
+vulnwatch:
+  nvd:
+    # Set to false to turn off the scheduled NVD sync (the tests do this).
+    enabled: true
+    base-url: https://services.nvd.nist.gov/rest/json/cves/2.0
+    # Optional. With a key NVD allows 50 requests per 30 s instead of 5. Empty means no key.
+    api-key: ${NVD_API_KEY:}
+    # Time between the end of one sync and the start of the next.
+    poll-interval: 2h
+    # Wait this long after startup before the first sync.
+    initial-delay: 10s
+    # How far back the very first sync goes when nothing has been synced yet.
+    initial-lookback: 7d
+    # Each sync re-reads this much before the last cursor, so a CVE modified at the boundary is not missed.
+    overlap: 5m
+    # CVEs per NVD request (NVD's maximum is 2000).
+    results-per-page: 2000
+    # Minimum time between two NVD requests: 5 requests per 30 s without an API key.
+    request-interval: 6s
+    connect-timeout: 10s
+    read-timeout: 60s
+    # Retry on 429, 5xx and network errors, waiting 6 s, 12 s, 24 s, ... (at most 60 s) between attempts.
+    retry:
+      max-attempts: 5
+      initial-backoff: 6s
+      multiplier: 2
+      max-backoff: 60s

@@ -11,7 +11,6 @@ services:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      - ./sample-data:/sample-data:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U vulnwatch -d vulnwatch"]
       interval: 5s
@@ -22,6 +21,8 @@ services:
     build: .
     environment:
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/vulnwatch
+      # Optional NVD API key from your shell or a .env file; empty means no key.
+      NVD_API_KEY: ${NVD_API_KEY:-}
     ports:
       - "${APP_PORT:-8080}:8080"
     depends_on:

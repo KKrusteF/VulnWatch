@@ -17,8 +17,9 @@ import java.util.Set;
 /**
  * Base class for tests that start the whole application against a real Postgres container.
  * Spring caches the application context, so all subclasses share one app and one container.
+ * The scheduled NVD sync is switched off so tests never call the real NVD.
  */
-@SpringBootTest
+@SpringBootTest(properties = "vulnwatch.nvd.enabled=false")
 @AutoConfigureMockMvc
 @Import(TestcontainersConfiguration.class)
 public abstract class AbstractIntegrationTest {
