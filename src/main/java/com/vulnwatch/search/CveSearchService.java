@@ -1,6 +1,7 @@
 package com.vulnwatch.search;
 
 import co.elastic.clients.elasticsearch.ElasticsearchClient;
+import co.elastic.clients.elasticsearch._types.ElasticsearchException;
 import co.elastic.clients.elasticsearch._types.FieldValue;
 import co.elastic.clients.elasticsearch._types.SortOrder;
 import co.elastic.clients.elasticsearch._types.query_dsl.Operator;
@@ -13,7 +14,6 @@ import com.vulnwatch.web.PageResponse;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
@@ -85,7 +85,9 @@ public class CveSearchService {
                             .trackTotalHits(t -> t.enabled(true)),
                     CveDocument.class);
         } catch (IOException e) {
-            throw new UncheckedIOException("Search request to Elasticsearch failed", e);
+            throw SearchUnavailableException.from("Search", e);
+        } catch (ElasticsearchException e) {
+            throw SearchUnavailableException.classify("Search", e);
         }
 
         List<CveResponse> items = response.hits().hits().stream()

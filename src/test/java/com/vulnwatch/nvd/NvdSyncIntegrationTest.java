@@ -13,12 +13,14 @@ import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import com.vulnwatch.search.CveSearchIndexer;
+import com.vulnwatch.search.SearchUnavailableException;
 import org.springframework.web.client.HttpServerErrorException;
 
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Arrays;
+import java.util.List;
 import java.util.stream.Collectors;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
@@ -31,8 +33,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.hamcrest.Matchers.contains;
 import static org.mockito.ArgumentMatchers.anyCollection;
+import static org.awaitility.Awaitility.await;
 import static org.mockito.Mockito.doThrow;
-
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -41,6 +45,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 /**
  * Runs the real sync (client, mapper, upsert, cursor) against a fake NVD (WireMock) and a real
  * Postgres container. The clock is a Mockito mock, so each test decides what "now" is.
+ * The indexer is a spy, so a test can make Elasticsearch look unavailable.
  */
 class NvdSyncIntegrationTest extends AbstractIntegrationTest {
 
@@ -255,40 +260,61 @@ class NvdSyncIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
-    void syncedCvesAreSearchable() throws Exception {
+    void syncWritesOneOutboxRowPerCreatedOrUpdatedCveAndNoneForUnchanged() {
+        stubPage(0, 2, cve("CVE-2026-0001", "2026-11-17T10:00:00.000", "HIGH"),
+                cve("CVE-2026-0002", "2026-11-17T11:00:00.000", "LOW"));
+
+        syncService.sync();
+        assertThat(outboxRows()).containsExactly("CVE-2026-0001 CREATED", "CVE-2026-0002 CREATED");
+
+        syncService.sync(); // same data again: both unchanged
+        assertThat(outboxRows()).hasSize(2);
+
+        nvd.resetAll();
+        stubPage(0, 1, cve("CVE-2026-0002", "2026-11-18T11:30:00.000", "CRITICAL"));
+        syncService.sync();
+        assertThat(outboxRows()).containsExactly("CVE-2026-0001 CREATED", "CVE-2026-0002 CREATED",
+                "CVE-2026-0002 UPDATED");
+    }
+
+    @Test
+    void publishedEventsMakeSyncedCvesSearchable() throws Exception {
+        startKafkaListener();
         stubPage(0, 2, cve("CVE-2026-0001", "2026-11-17T10:00:00.000", "HIGH", "apache"),
                 cve("CVE-2026-0002", "2026-11-17T11:00:00.000", "LOW"));
 
         syncService.sync();
-        indexManager.refresh();
+        assertThat(outboxPublisher.publishPending()).isEqualTo(2);
 
-        mockMvc.perform(get("/api/cves/search").param("q", "description"))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.totalItems").value(2));
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+            indexManager.refresh();
+            mockMvc.perform(get("/api/cves/search").param("q", "description"))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.totalItems").value(2));
+        });
         mockMvc.perform(get("/api/cves/search").param("q", "description").param("vendor", "apache"))
                 .andExpect(jsonPath("$.items[*].id", contains("CVE-2026-0001")));
     }
 
     @Test
-    void failedIndexingKeepsTheCursorAndTheNextSyncRepairsTheIndex() {
+    void syncSucceedsAndAdvancesTheCursorWhileElasticsearchIsDown() {
         stubPage(0, 2, cve("CVE-2026-0001", "2026-11-17T10:00:00.000", "HIGH"),
                 cve("CVE-2026-0002", "2026-11-17T11:00:00.000", "LOW"));
-        doThrow(new IllegalStateException("Elasticsearch is down")).when(spiedIndexer).indexByIds(anyCollection());
+        doThrow(new SearchUnavailableException("Elasticsearch is down (test)", null))
+                .when(spiedIndexer).indexByIds(anyCollection());
 
-        assertThatThrownBy(() -> syncService.sync()).hasMessage("Elasticsearch is down");
+        SyncResult result = syncService.sync();
 
-        assertThat(syncStateRepository.findById(NvdSyncService.SOURCE)).isEmpty();
-        assertThat(cveRepository.count()).isEqualTo(2);
-        indexManager.refresh();
-        assertThat(indexManager.documentCount()).isZero();
-
-        org.mockito.Mockito.reset(spiedIndexer); // back to the real indexer
-        SyncResult second = syncService.sync();
-        indexManager.refresh();
-
-        assertThat(second.unchanged()).isEqualTo(2);
-        assertThat(indexManager.documentCount()).isEqualTo(2);
+        assertThat(result.created()).isEqualTo(2);
         assertThat(cursor()).isEqualTo(NOW);
+        assertThat(cveRepository.count()).isEqualTo(2);
+        assertThat(outboxRows()).hasSize(2);
+        // The sync no longer talks to Elasticsearch at all; indexing happens later through Kafka.
+        verify(spiedIndexer, never()).indexByIds(anyCollection());
+    }
+
+    private List<String> outboxRows() {
+        return jdbc.queryForList("select cve_id || ' ' || event_type from cve_outbox order by id", String.class);
     }
 
     private void setNow(Instant now) {

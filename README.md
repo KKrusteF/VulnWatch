@@ -2,20 +2,19 @@
 
 A CVE feed aggregator built with Java 21 and Spring Boot 3. It polls the public
 [NVD CVE API](https://nvd.nist.gov/developers/vulnerabilities), keeps every CVE in PostgreSQL,
-indexes them into Elasticsearch for full-text search, and exposes a REST API on top. Kafka is added in the last stage.
+publishes an event to Kafka for each new or changed CVE, indexes those events into Elasticsearch
+for full-text search, and exposes a REST API on top.
 
-The project is built in four stages. **Stages 1 to 3 are done**; stage 4 is planned.
+The project was built in four stages, all done:
 
-| Stage | What it adds | Status |
-|---|---|---|
-| 1 | REST API and PostgreSQL (Flyway schema, get by ID, filtered list, stats) | done |
-| 2 | Scheduled NVD ingestion with retry/backoff, upsert by CVE ID | done |
-| 3 | Elasticsearch index with an explicit mapping, full-text search with filters | done |
-| 4 | Kafka between ingestion and indexing | planned |
+| Stage | What it adds |
+|---|---|
+| 1 | REST API and PostgreSQL (Flyway schema, get by ID, filtered list, stats) |
+| 2 | Scheduled NVD ingestion with retry/backoff, upsert by CVE ID |
+| 3 | Elasticsearch index with an explicit mapping, full-text search with filters |
+| 4 | Kafka between ingestion and indexing, with a transactional outbox |
 
 ## Architecture
-
-Solid lines exist today. Dashed parts arrive in stage 4, where Kafka replaces the direct indexing call.
 
 ```mermaid
 flowchart LR
@@ -25,39 +24,50 @@ flowchart LR
     subgraph app["VulnWatch (Spring Boot)"]
         api["REST API<br/>/api/cves, /api/cves/search, /api/stats"]
         ingest["NVD sync<br/>scheduled, paced, retried"]
-        indexer["Kafka consumer / indexer<br/>(stage 4)"]:::planned
+        publisher["Outbox publisher<br/>every second"]
+        indexer["Kafka consumer<br/>indexer"]
     end
 
-    pg[("PostgreSQL<br/>source of truth")]
-    kafka{{"Kafka topic<br/>(stage 4)"}}:::planned
+    pg[("PostgreSQL<br/>CVEs + outbox<br/>source of truth")]
+    kafka{{"Kafka topic<br/>vulnwatch.cve-events"}}
+    dlt{{"Dead letter topic<br/>vulnwatch.cve-events.DLT"}}
     es[("Elasticsearch<br/>search index, rebuildable")]
 
     client --> api
     api -->|get by ID, list, stats| pg
     api -->|full-text search| es
     nvd -->|CVEs modified since last sync| ingest
-    ingest -->|upsert by CVE ID, save sync cursor| pg
-    ingest -->|index each stored page, document ID = CVE ID| es
-    ingest -.->|event per new or changed CVE| kafka
-    kafka -.-> indexer
-    indexer -.->|index, document ID = CVE ID| es
-
-    classDef planned stroke-dasharray: 5 5
+    ingest -->|one transaction: upsert CVE + outbox row| pg
+    pg -->|unpublished outbox rows| publisher
+    publisher -->|event per new or changed CVE, key = CVE ID| kafka
+    kafka --> indexer
+    indexer -->|reads current row| pg
+    indexer -->|index, document ID = CVE ID| es
+    indexer -.->|events that keep failing| dlt
 ```
 
-How a sync run works:
+How a change travels from NVD to the search index:
 
 ```
-NvdSyncScheduler     wakes up on a timer and starts a sync
+NvdSyncScheduler      wakes up on a timer and starts a sync
      |
-NvdSyncService       works out the time window: from the saved cursor to now
-     |                 for each page of results:
-     |-- NvdClient         one paced HTTP request, retried on 429 / 5xx / network errors
-     |-- NvdCveMapper      NVD JSON -> the fields VulnWatch stores
-     |-- CveUpsertService  insert new, update changed, skip unchanged (one transaction per page)
-     |-- CveSearchIndexer  reads the stored rows back from Postgres and bulk-indexes them
+NvdSyncService        works out the time window: from the saved cursor to now
+     |                  for each page of results:
+     |-- NvdClient          one paced HTTP request, retried on 429 / 5xx / network errors
+     |-- NvdCveMapper       NVD JSON -> the fields VulnWatch stores
+     |-- CveUpsertService   ONE transaction: insert new, update changed, skip unchanged,
+     |                      and add an outbox row for every created or updated CVE
+     saves the cursor (sync_state table) once the whole window is stored
+
+OutboxPublisher       every second: locks a batch of outbox rows, sends them to Kafka,
+     |                waits for the acknowledgement, deletes the rows
+     v
+Kafka topic           vulnwatch.cve-events (3 partitions, message key = CVE ID)
      |
-     saves the cursor (sync_state table) once the whole window is stored and indexed
+CveEventListener      one event at a time: reads the CVE's current row from PostgreSQL
+     |                and indexes it
+     v
+Elasticsearch         index "cves", document ID = CVE ID
 ```
 
 How an API request works:
@@ -79,17 +89,19 @@ internet connection. Nothing else.
 docker compose up --build
 ```
 
-This builds the app image and starts PostgreSQL, Elasticsearch and the app. Elasticsearch needs
-about 1 GB of memory and half a minute to start; the app waits for it. Ten seconds after startup the
-first sync begins and fetches every CVE that NVD modified in the last 7 days. That is usually a
-few thousand CVEs and takes under a minute, because requests are spaced 6 seconds apart. When
-you see this line in the log, the data is there:
+This builds the app image and starts PostgreSQL, Kafka, Elasticsearch and the app. Elasticsearch
+needs about 1 GB of memory and half a minute to start. Ten seconds after startup the first sync
+begins and fetches every CVE that NVD modified in the last 7 days. That is usually a few thousand
+CVEs and takes under a minute, because requests are spaced 6 seconds apart. You will see these
+lines in the log:
 
 ```
 NVD sync finished: window ... to ..., fetched 8801, created 8801, updated 0, unchanged 0
+Published 2000 CVE events to Kafka
 ```
 
-Then try these in a browser:
+Events are indexed one at a time, so after a large first sync the search index catches up a
+little later than the log line. Then try these in a browser:
 
 - <http://localhost:8080/api/cves/search?q=remote+code+execution&size=5>
 - <http://localhost:8080/api/cves/search?q=overflow&severity=critical>
@@ -99,17 +111,49 @@ Then try these in a browser:
 - `http://localhost:8080/api/cves/<an ID from the list>`
 
 After that the app syncs again every 2 hours, asking only for what changed since the last run.
-Restarting is safe: the cursor is stored in the database, so the next sync continues from there.
+Restarting is safe: the sync cursor and the outbox are in the database, and Kafka remembers how
+far the consumer has read.
 
-Stop with `Ctrl+C`, then `docker compose down`. Add `-v` to also delete the database and
+Stop with `Ctrl+C`, then `docker compose down`. Add `-v` to also delete the database, Kafka and
 search index volumes.
 
-If port 8080, 5432 or 9200 is already taken on your machine, pick others:
+If port 8080, 5432, 9200 or 9094 is already taken on your machine, pick others:
 
 ```sh
-APP_PORT=8081 POSTGRES_PORT=5433 ES_PORT=9201 docker compose up --build        # bash
-$env:APP_PORT=8081; $env:POSTGRES_PORT=5433; $env:ES_PORT=9201; docker compose up --build   # PowerShell
+APP_PORT=8081 POSTGRES_PORT=5433 ES_PORT=9201 KAFKA_PORT=9095 docker compose up --build        # bash
+$env:APP_PORT=8081; $env:POSTGRES_PORT=5433; $env:ES_PORT=9201; $env:KAFKA_PORT=9095; docker compose up --build   # PowerShell
 ```
+
+## Events and delivery guarantees
+
+- **No change is lost between PostgreSQL and Kafka.** A CVE change and its outbox row are written
+  in one database transaction (the transactional outbox pattern). The publisher deletes a row only
+  after Kafka acknowledged the message.
+- **Delivery is at-least-once.** If the app stops between "Kafka acknowledged" and "row deleted",
+  the event is sent again. That is harmless: the consumer always indexes the CVE's current row
+  under its CVE ID, so a repeated or out-of-order event just writes the same document again.
+- **The event is a notification, not a copy of the data.** It carries the CVE ID, `CREATED` or
+  `UPDATED`, and two timestamps:
+  `{"cveId":"CVE-2021-44228","type":"UPDATED","lastModifiedAt":"...","occurredAt":"..."}`.
+- **Ingestion does not depend on Elasticsearch.** While Elasticsearch is down, syncs keep running,
+  events wait in Kafka, and the consumer retries with a growing pause (1 s up to 30 s) for as long
+  as it takes. `GET /api/cves/search` answers `503` meanwhile; the other endpoints keep working.
+- **Broken events do not block the rest.** A message that is not valid JSON goes straight to the
+  dead letter topic `vulnwatch.cve-events.DLT`. Any other failure is retried twice and then sent
+  there too.
+
+To look at Kafka while the stack is running:
+
+```sh
+# consumer position and lag per partition
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group vulnwatch-indexer
+
+# read the events from the beginning (Ctrl+C to stop)
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic vulnwatch.cve-events --from-beginning --property print.key=true
+```
+
+In Git Bash on Windows, put `MSYS_NO_PATHCONV=1` in front of these commands, otherwise the
+`/opt/...` path is rewritten to a Windows path. PowerShell and `cmd` need nothing extra.
 
 ## Search index
 
@@ -120,11 +164,14 @@ and can be thrown away at any time.
   `description` is analysed English text; `severity` and `vendors` are exact keywords;
   unknown fields are rejected.
 - The document ID is the CVE ID, so indexing a CVE again overwrites it instead of duplicating it.
-- After each page of a sync is stored in PostgreSQL, the same CVEs are read back from PostgreSQL
-  and sent to Elasticsearch in one bulk request. If that fails, the sync run fails, the cursor
-  stays where it was, and the next run indexes the same window again.
+- Elasticsearch is not allowed to create the `cves` index on its own (`action.auto_create_index`
+  in `compose.yaml`), so the index can only ever exist with this mapping.
 - On startup the app creates the index if it is missing. If the index holds fewer documents than
-  PostgreSQL has CVEs, it rebuilds the whole index from PostgreSQL.
+  PostgreSQL has CVEs, it rebuilds the whole index from PostgreSQL. If Elasticsearch is not
+  reachable at startup, the app starts anyway and logs a warning.
+- If the index disappears while the app is running, the next event recreates it with the correct
+  mapping. Only CVEs that change afterwards are indexed until the next restart, which rebuilds
+  everything.
 
 To rebuild the index by hand, delete it and restart the app:
 
@@ -237,9 +284,9 @@ On Windows `cmd` or PowerShell, write `.\gradlew.bat` instead of `./gradlew`.
 
 | Command | What it does |
 |---|---|
-| `./gradlew test` | Runs the tests. They start throwaway PostgreSQL and Elasticsearch containers with Testcontainers and a fake NVD server, so they never call the real NVD. |
-| `./gradlew bootTestRun` | Runs the app on port 8080 against throwaway PostgreSQL and Elasticsearch containers, syncing from the real NVD. Data is gone when you stop it. |
-| `docker compose up -d postgres elasticsearch` then `./gradlew bootRun` | Runs the app from source against the Compose database and search index, which keep their data. |
+| `./gradlew test` | Runs the tests. They start throwaway PostgreSQL, Kafka and Elasticsearch containers with Testcontainers and a fake NVD server, so they never call the real NVD. |
+| `./gradlew bootTestRun` | Runs the app on port 8080 against throwaway PostgreSQL, Kafka and Elasticsearch containers, syncing from the real NVD. Data is gone when you stop it. |
+| `docker compose up -d postgres kafka elasticsearch` then `./gradlew bootRun` | Runs the app from source against the Compose database, broker and search index, which keep their data. |
 | `./gradlew build` | Compiles, tests and builds the runnable jar in `build/libs/`. |
 
 To look inside the database while Compose is running:
@@ -257,16 +304,17 @@ build.gradle                       dependencies and build setup
 compose.yaml, Dockerfile           the local stack and the app image
 src/main/resources/
   application.yml                  configuration
-  db/migration/V*.sql              Flyway database migrations
+  db/migration/V*.sql              Flyway database migrations (CVEs, sync cursor, outbox)
   elasticsearch/cve-index.json     the Elasticsearch index mapping
 src/main/java/com/vulnwatch/
   VulnWatchApplication.java        entry point
   cve/                             the CVE entity, repository, read service, upsert service, controller
   nvd/                             NVD client, JSON mapping, sync service, scheduler, settings
-  search/                          index creation, indexing from Postgres, search service and endpoint
+  events/                          the outbox table, the event record, the publisher that sends to Kafka
+  search/                          index creation, the Kafka consumer that indexes, search service and endpoint
   stats/                           the stats endpoint
   web/                             shared HTTP pieces: error handling, paging, converters
-src/test/java/com/vulnwatch/       tests (JUnit 5, Testcontainers, MockMvc, WireMock)
+src/test/java/com/vulnwatch/       tests (JUnit 5, Testcontainers, MockMvc, WireMock, Awaitility)
 ```
 
 The database user and password (`vulnwatch` / `vulnwatch`) are local development defaults.

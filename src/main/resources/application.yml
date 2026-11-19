@@ -10,6 +10,39 @@ spring:
   elasticsearch:
     # Local-dev default; Docker Compose overrides it with SPRING_ELASTICSEARCH_URIS.
     uris: http://localhost:9200
+  kafka:
+    # Local-dev default (the host port of the Compose broker); Compose overrides it with SPRING_KAFKA_BOOTSTRAP_SERVERS.
+    bootstrap-servers: localhost:9094
+    producer:
+      # A send counts as done only when every in-sync replica has the message.
+      acks: all
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        # Retries inside the producer never write the same message twice.
+        enable.idempotence: true
+        # Plain JSON without a Java class name header, so any consumer can read it.
+        spring.json.add.type.headers: false
+    consumer:
+      group-id: vulnwatch-indexer
+      # A new consumer group starts with the oldest message still in the topic.
+      auto-offset-reset: earliest
+      # Spring commits the offset after the listener finished, not Kafka on a timer.
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # Wraps the JSON deserializer so a message that is not valid JSON goes to the error handler
+      # (and from there to the dead letter topic) instead of failing the consumer in a loop.
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      properties:
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JsonDeserializer
+        spring.json.value.default.type: com.vulnwatch.events.CveEvent
+        spring.json.use.type.headers: false
+        spring.json.trusted.packages: com.vulnwatch.events
+  task:
+    scheduling:
+      pool:
+        # @Scheduled methods share one thread by default, and a long NVD sync would otherwise block the outbox publisher.
+        size: 2
   jpa:
     # Do not keep a DB session open while the JSON response is written; all loading happens in services.
     open-in-view: false
@@ -69,3 +102,24 @@ vulnwatch:
     index-name: cves
     # CVEs loaded from Postgres and sent to Elasticsearch per bulk request when rebuilding the index.
     reindex-batch-size: 500
+
+  events:
+    # Kafka topic for "CVE created/updated" events; failed events go to <topic>.DLT.
+    topic: vulnwatch.cve-events
+    # Partitions of the topic: up to this many consumers can index in parallel.
+    partitions: 3
+    # Set to false to stop the scheduled outbox publisher (the tests do this and publish explicitly).
+    publisher-enabled: true
+    # Pause between two outbox publishing runs.
+    publish-interval: 1s
+    # Outbox rows sent per transaction.
+    publish-batch-size: 500
+    # How long to wait for Kafka to acknowledge a batch before rolling it back.
+    send-timeout: 10s
+    listener-retry:
+      # Elasticsearch unavailable: retry after 1 s, 2 s, 4 s, ... at most 30 s apart, without limit.
+      unavailable-initial-backoff: 1s
+      unavailable-max-backoff: 30s
+      # Any other error: retry this many times this far apart, then send the event to the dead letter topic.
+      failure-interval: 1s
+      failure-retries: 2

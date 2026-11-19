@@ -10,7 +10,8 @@ import org.springframework.stereotype.Component;
 /**
  * Runs once after startup: creates the index if needed and rebuilds it from Postgres when it holds
  * fewer documents than the database (for example after the index was deleted). If Elasticsearch is
- * not reachable, the exception stops the application, so a broken setup is noticed right away.
+ * unreachable, the application still starts: the API and the NVD sync only need Postgres, and the
+ * indexer recreates a missing index when it handles the next event.
  */
 @Component
 public class SearchIndexInitializer implements ApplicationRunner {
@@ -30,7 +31,13 @@ public class SearchIndexInitializer implements ApplicationRunner {
 
     @Override
     public void run(ApplicationArguments args) {
-        initialize();
+        try {
+            initialize();
+        } catch (SearchUnavailableException e) {
+            // Any other exception still stops startup: that would be a bug, not a temporary outage.
+            log.warn("Search is unavailable ({}); starting without it. The index will be checked again "
+                    + "when the first event is indexed.", e.getMessage());
+        }
     }
 
     /** Creates the index if needed and fills it when it is behind Postgres. */

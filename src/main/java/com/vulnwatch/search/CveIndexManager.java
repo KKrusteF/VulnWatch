@@ -1,6 +1,7 @@
 package com.vulnwatch.search;
 
 import co.elastic.clients.elasticsearch.ElasticsearchClient;
+import co.elastic.clients.elasticsearch._types.ElasticsearchException;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.stereotype.Component;
 
@@ -10,7 +11,8 @@ import java.io.UncheckedIOException;
 
 /**
  * Creates the CVE index with the explicit mapping from {@code elasticsearch/cve-index.json}
- * and answers simple questions about it.
+ * and answers simple questions about it. Throws {@link SearchUnavailableException} when
+ * Elasticsearch cannot be reached.
  */
 @Component
 public class CveIndexManager {
@@ -40,8 +42,13 @@ public class CveIndexManager {
                 client.indices().create(c -> c.index(indexName).withJson(mapping));
             }
             return true;
+        } catch (ElasticsearchException e) {
+            if ("resource_already_exists_exception".equals(e.error().type())) {
+                return false; // created by someone else between the check and the create
+            }
+            throw SearchUnavailableException.classify("Creating index " + indexName, e);
         } catch (IOException e) {
-            throw new UncheckedIOException("Could not create Elasticsearch index " + indexName, e);
+            throw SearchUnavailableException.from("Creating index " + indexName, e);
         }
     }
 
@@ -49,8 +56,10 @@ public class CveIndexManager {
     public long documentCount() {
         try {
             return client.count(c -> c.index(indexName)).count();
+        } catch (ElasticsearchException e) {
+            throw SearchUnavailableException.classify("Counting documents", e);
         } catch (IOException e) {
-            throw new UncheckedIOException(e);
+            throw SearchUnavailableException.from("Counting documents", e);
         }
     }
 

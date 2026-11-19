@@ -3,7 +3,6 @@ package com.vulnwatch.nvd;
 import com.vulnwatch.cve.CveData;
 import com.vulnwatch.cve.CveUpsertService;
 import com.vulnwatch.cve.UpsertResult;
-import com.vulnwatch.search.CveSearchIndexer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -30,16 +29,14 @@ public class NvdSyncService {
 
     private final NvdClient client;
     private final CveUpsertService upsertService;
-    private final CveSearchIndexer searchIndexer;
     private final SyncStateRepository syncStateRepository;
     private final NvdProperties properties;
     private final Clock clock;
 
-    public NvdSyncService(NvdClient client, CveUpsertService upsertService, CveSearchIndexer searchIndexer,
-                          SyncStateRepository syncStateRepository, NvdProperties properties, Clock clock) {
+    public NvdSyncService(NvdClient client, CveUpsertService upsertService, SyncStateRepository syncStateRepository,
+                          NvdProperties properties, Clock clock) {
         this.client = client;
         this.upsertService = upsertService;
-        this.searchIndexer = searchIndexer;
         this.syncStateRepository = syncStateRepository;
         this.properties = properties;
         this.clock = clock;
@@ -73,12 +70,9 @@ public class NvdSyncService {
                     }
                     break;
                 }
+                // Stores the page and, in the same transaction, an outbox event per created or updated CVE.
+                // Indexing happens later through Kafka, so the sync keeps working while Elasticsearch is down.
                 totals = totals.plus(upsertService.upsertAll(cves));
-                // Index every CVE on the page, changed or not. If indexing failed on an earlier run, the
-                // cursor did not move, so this window is fetched again and its rows are now "unchanged" in
-                // Postgres; indexing all of them is what repairs the index. Repeating it is harmless because
-                // the document ID is the CVE ID. An exception here stops the sync before the cursor moves.
-                searchIndexer.indexByIds(cves.stream().map(CveData::id).toList());
                 fetched += cves.size();
                 startIndex += cves.size();
                 if (startIndex >= page.totalResults()) {

@@ -1,6 +1,7 @@
 package com.vulnwatch.web;
 
 import com.vulnwatch.cve.CveNotFoundException;
+import com.vulnwatch.search.SearchUnavailableException;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
@@ -26,6 +27,16 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
         ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND,
                 "No CVE with ID " + ex.getId() + " is stored in VulnWatch.");
         problem.setTitle("CVE not found");
+        return problem;
+    }
+
+    /** Elasticsearch is down: search cannot answer, but the rest of the API (backed by Postgres) still works. */
+    @ExceptionHandler(SearchUnavailableException.class)
+    public ProblemDetail handleSearchUnavailable(SearchUnavailableException ex) {
+        logger.warn(ex.getMessage());
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.SERVICE_UNAVAILABLE,
+                "Search is temporarily unavailable. Try again later, or use /api/cves to list CVEs.");
+        problem.setTitle("Search unavailable");
         return problem;
     }
 
